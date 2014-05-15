@@ -40,7 +40,7 @@
   
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <elasticsearch.version>0.90.0</elasticsearch.version>
+    <elasticsearch.version>0.90.13</elasticsearch.version>
     <tika.version>1.4</tika.version>
   </properties>
   
@@ -221,28 +221,4 @@
       </plugin>
     </plugins>
   </build>
-  
-  <profiles>
-    <profile>
-      <id>release</id>
-      <build>
-        <plugins>
-          <plugin>
-            <groupId>org.apache.maven.plugins</groupId>
-            <artifactId>maven-gpg-plugin</artifactId>
-            <version>1.4</version>
-            <executions>
-              <execution>
-                <id>sign-artifacts</id>
-                <phase>verify</phase>
-                <goals>
-                  <goal>sign</goal>
-                </goals>
-              </execution>
-            </executions>
-          </plugin>
-        </plugins>
-      </build>
-    </profile>
-  </profiles>
 </project>
