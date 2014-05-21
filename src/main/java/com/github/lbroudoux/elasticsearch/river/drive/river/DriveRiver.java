@@ -18,9 +18,10 @@
  */
 package com.github.lbroudoux.elasticsearch.river.drive.river;
 
-import java.util.Arrays;
-import java.util.Map;
-
+import com.github.lbroudoux.elasticsearch.river.drive.connector.DriveChanges;
+import com.github.lbroudoux.elasticsearch.river.drive.connector.DriveConnector;
+import com.google.api.services.drive.model.Change;
+import com.google.api.services.drive.model.File;
 import org.apache.tika.metadata.Metadata;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.admin.indices.mapping.put.PutMappingResponse;
@@ -43,450 +44,474 @@ import org.elasticsearch.river.River;
 import org.elasticsearch.river.RiverName;
 import org.elasticsearch.river.RiverSettings;
 
-import com.github.lbroudoux.elasticsearch.river.drive.connector.DriveChanges;
-import com.github.lbroudoux.elasticsearch.river.drive.connector.DriveConnector;
-import com.github.lbroudoux.elasticsearch.river.drive.river.TikaHolder;
-import com.google.api.services.drive.model.Change;
-import com.google.api.services.drive.model.File;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Map;
 
 import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+
 /**
  * A River component for scanning and indexing Google Drive documents into Elasticsearch.
+ *
  * @author laurent
  */
-public class DriveRiver extends AbstractRiverComponent implements River{
-   
-   private final Client client;
-   
-   private final String indexName;
+public class DriveRiver extends AbstractRiverComponent implements River {
 
-   private final String typeName;
+    private final Client client;
 
-   private final long bulkSize;
-   
-   private volatile Thread feedThread;
+    private final String indexName;
 
-   private volatile boolean closed = false;
-   
-   private final DriveRiverFeedDefinition feedDefinition;
-   
-   private final DriveConnector drive;
-   
-   @Inject
-   @SuppressWarnings({ "unchecked" })
-   protected DriveRiver(RiverName riverName, RiverSettings settings, Client client) throws Exception{
-      super(riverName, settings);
-      this.client = client;
-      
-      // Deal with connector settings.
-      if (settings.settings().containsKey("google-drive")){
-         Map<String, Object> feed = (Map<String, Object>)settings.settings().get("google-drive");
-         
-         // Retrieve feed settings.
-         String feedname = XContentMapValues.nodeStringValue(feed.get("name"), null);
-         String folder = XContentMapValues.nodeStringValue(feed.get("folder"), null);
-         int updateRate = XContentMapValues.nodeIntegerValue(feed.get("update_rate"), 15 * 60 * 1000);
-         
-         String[] includes = DriveRiverUtil.buildArrayFromSettings(settings.settings(), "google-drive.includes");
-         String[] excludes = DriveRiverUtil.buildArrayFromSettings(settings.settings(), "google-drive.excludes");
-         
-         // Retrieve connection settings.
-         String clientId = XContentMapValues.nodeStringValue(feed.get("clientId"), null);
-         String clientSecret = XContentMapValues.nodeStringValue(feed.get("clientSecret"), null);
-         String refreshToken = XContentMapValues.nodeStringValue(feed.get("refreshToken"), null);
-         
-         feedDefinition = new DriveRiverFeedDefinition(feedname, folder, updateRate, 
-               Arrays.asList(includes), Arrays.asList(excludes), clientId, clientSecret, refreshToken);
-      } else {
-         logger.error("You didn't define the google-drive settings. Exiting... See https://github.com/lbroudoux/es-google-drive-river");
-         indexName = null;
-         typeName = null;
-         bulkSize = 100;
-         feedDefinition = null;
-         drive = null;
-         return;
-      }
-      
-      // Deal with index settings if provided.
-      if (settings.settings().containsKey("index")) {
-         Map<String, Object> indexSettings = (Map<String, Object>)settings.settings().get("index");
-         
-         indexName = XContentMapValues.nodeStringValue(
-               indexSettings.get("index"), riverName.name());
-         typeName = XContentMapValues.nodeStringValue(
-               indexSettings.get("type"), DriveRiverUtil.INDEX_TYPE_DOC);
-         bulkSize = XContentMapValues.nodeLongValue(
-               indexSettings.get("bulk_size"), 100);
-      } else {
-         indexName = riverName.name();
-         typeName = DriveRiverUtil.INDEX_TYPE_DOC;
-         bulkSize = 100;
-      }
-      
-      // We need to connect to Google Drive.
-      drive = new DriveConnector(feedDefinition.getClientId(), feedDefinition.getClientSecret(), feedDefinition.getRefreshToken());
-      drive.connectUserDrive(feedDefinition.getFolder());
-   }
+    private final String typeName;
 
-   @Override
-   public void start(){
-      if (logger.isInfoEnabled()){
-         logger.info("Starting google drive river scanning");
-      }
-      try{
-         client.admin().indices().prepareCreate(indexName).execute().actionGet();
-      } catch (Exception e) {
-         if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException){
-            // that's fine.
-         } else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException){
-            // ok, not recovered yet..., lets start indexing and hope we recover by the first bulk.
-         } else {
-            logger.warn("failed to create index [{}], disabling river...", e, indexName);
+    private final long bulkSize;
+
+    private volatile Thread feedThread;
+
+    private volatile boolean closed = false;
+
+    private final DriveRiverFeedDefinition feedDefinition;
+
+    private final DriveConnector drive;
+
+    @Inject
+    @SuppressWarnings({"unchecked"})
+    protected DriveRiver(RiverName riverName, RiverSettings settings, Client client) throws Exception {
+        super(riverName, settings);
+        this.client = client;
+
+        // Deal with connector settings.
+        if (settings.settings().containsKey("google-drive")) {
+            Map<String, Object> feed = (Map<String, Object>) settings.settings().get("google-drive");
+
+            // Retrieve feed settings.
+            String feedname = XContentMapValues.nodeStringValue(feed.get("name"), null);
+            String folder = XContentMapValues.nodeStringValue(feed.get("folder"), null);
+            int updateRate = XContentMapValues.nodeIntegerValue(feed.get("update_rate"), 15 * 60 * 1000);
+
+            String[] includes = DriveRiverUtil.buildArrayFromSettings(settings.settings(), "google-drive.includes");
+            String[] excludes = DriveRiverUtil.buildArrayFromSettings(settings.settings(), "google-drive.excludes");
+
+            // Retrieve connection settings.
+            String clientId = XContentMapValues.nodeStringValue(feed.get("clientId"), null);
+            String clientSecret = XContentMapValues.nodeStringValue(feed.get("clientSecret"), null);
+            String refreshToken = XContentMapValues.nodeStringValue(feed.get("refreshToken"), null);
+
+            feedDefinition = new DriveRiverFeedDefinition(feedname, folder, updateRate,
+                    Arrays.asList(includes), Arrays.asList(excludes), clientId, clientSecret, refreshToken);
+        } else {
+            logger.error("You didn't define the google-drive settings. Exiting... See https://github.com/lbroudoux/es-google-drive-river");
+            indexName = null;
+            typeName = null;
+            bulkSize = 100;
+            feedDefinition = null;
+            drive = null;
             return;
-         }
-      }
-      
-      try{
-         // If needed, we create the new mapping for files
-         pushMapping(indexName, typeName, DriveRiverUtil.buildDriveFileMapping(typeName));       
-      } catch (Exception e) {
-         logger.warn("Failed to create mapping for [{}/{}], disabling river...",
-               e, indexName, typeName);
-         return;
-      }
-      
-      // We create as many Threads as there are feeds.
-      feedThread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "fs_slurper")
-            .newThread(new DriveScanner(feedDefinition));
-      feedThread.start();
-   }
+        }
 
-   @Override
-   public void close(){
-      if (logger.isInfoEnabled()){
-         logger.info("Closing google drive river");
-      }
-      closed = true;
+        // Deal with index settings if provided.
+        if (settings.settings().containsKey("index")) {
+            Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
 
-      // We have to close the Thread.
-      if (feedThread != null){
-         feedThread.interrupt();
-      }
-   }
-   
-   /**
-    * Check if a mapping already exists in an index
-    * @param index Index name
-    * @param type Mapping name
-    * @return true if mapping exists
-    */
-   private boolean isMappingExist(String index, String type) {
-      ClusterState cs = client.admin().cluster().prepareState()
-            .setIndices(index).execute().actionGet()
-            .getState();
-      // Check index metadata existence.
-      IndexMetaData imd = cs.getMetaData().index(index);
-      if (imd == null){
-         return false;
-      }
-      // Check mapping metadata existence.
-      MappingMetaData mdd = imd.mapping(type);
-      if (mdd != null){
-         return true;
-      }
-      return false;
-   }
-   
-   private void pushMapping(String index, String type, XContentBuilder xcontent) throws Exception {
-      if (logger.isTraceEnabled()){
-         logger.trace("pushMapping(" + index + ", " + type + ")");
-      }
-      
-      // If type does not exist, we create it
-      boolean mappingExist = isMappingExist(index, type);
-      if (!mappingExist) {
-         logger.debug("Mapping [" + index + "]/[" + type + "] doesn't exist. Creating it.");
+            indexName = XContentMapValues.nodeStringValue(
+                    indexSettings.get("index"), riverName.name());
+            typeName = XContentMapValues.nodeStringValue(
+                    indexSettings.get("type"), DriveRiverUtil.INDEX_TYPE_DOC);
+            bulkSize = XContentMapValues.nodeLongValue(
+                    indexSettings.get("bulk_size"), 100);
+        } else {
+            indexName = riverName.name();
+            typeName = DriveRiverUtil.INDEX_TYPE_DOC;
+            bulkSize = 100;
+        }
 
-         // Read the mapping json file if exists and use it.
-         if (xcontent != null){
-            if (logger.isTraceEnabled()){
-               logger.trace("Mapping for [" + index + "]/[" + type + "]=" + xcontent.string());
-            }
-            // Create type and mapping
-            PutMappingResponse response = client.admin().indices()
-                  .preparePutMapping(index)
-                  .setType(type)
-                  .setSource(xcontent)
-                  .execute().actionGet();       
-            if (!response.isAcknowledged()){
-               throw new Exception("Could not define mapping for type [" + index + "]/[" + type + "].");
+        // We need to connect to Google Drive.
+        drive = new DriveConnector(feedDefinition.getClientId(), feedDefinition.getClientSecret(), feedDefinition.getRefreshToken(), client);
+        drive.connectUserDrive(feedDefinition.getFolder());
+    }
+
+
+    @Override
+    public void start() {
+        if (logger.isInfoEnabled()) {
+            logger.info("Starting google drive river scanning");
+        }
+        try {
+            client.admin().indices().prepareCreate(indexName).execute().actionGet();
+        } catch (Exception e) {
+            if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
+                // that's fine.
+            } else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
+                // ok, not recovered yet..., lets start indexing and hope we recover by the first bulk.
             } else {
-               if (logger.isDebugEnabled()){
-                  if (mappingExist){
-                     logger.debug("Mapping definition for [" + index + "]/[" + type + "] succesfully merged.");
-                  } else {
-                     logger.debug("Mapping definition for [" + index + "]/[" + type + "] succesfully created.");
-                  }
-               }
+                logger.warn("failed to create index [{}], disabling river...", e, indexName);
+                return;
             }
-         } else {
-            if (logger.isDebugEnabled()){
-               logger.debug("No mapping definition for [" + index + "]/[" + type + "]. Ignoring.");
-            }
-         }
-      } else {
-         if (logger.isDebugEnabled()){
-            logger.debug("Mapping [" + index + "]/[" + type + "] already exists and mergeMapping is not set.");
-         }
-      }
-      if (logger.isTraceEnabled()){
-         logger.trace("/pushMapping(" + index + ", " + type + ")");
-      }
-   }
-   
-   /** */
-   private class DriveScanner implements Runnable{
-   
-      private BulkRequestBuilder bulk;
-      private DriveRiverFeedDefinition feedDefinition;
-      
-      public DriveScanner(DriveRiverFeedDefinition feedDefinition){
-         this.feedDefinition = feedDefinition;
-      }
-      
-      @Override
-      public void run(){
-         while (true){
-            if (closed){
-               return;
-            }
-            
-            try{
-               if (isStarted()){
-                  bulk = client.prepareBulk();
-                  // Scan folder starting from last changes id, then record the new one.
-                  Long lastChangesId = getLastChangesIdFromRiver("_lastChangesId");
-                  lastChangesId = scan(feedDefinition.getFolder(), lastChangesId);
-                  updateRiver("_lastChangesId", lastChangesId);
-                  
-                  // If some bulkActions remains, we should commit them
-                  commitBulk();
-               } else {
-                  logger.info("Google Drive River is disabled for {}", riverName().name());
-               }
-            } catch (Exception e){
-               logger.warn("Error while indexing content from {}", feedDefinition.getFolder());
-               if (logger.isDebugEnabled()){
-                  logger.debug("Exception for folder {} is {}", feedDefinition.getFolder(), e);
-                  e.printStackTrace();
-               }
-            }
-            
-            try {
-               if (logger.isDebugEnabled()){
-                  logger.debug("Google drive river is going to sleep for {} ms", feedDefinition.getUpdateRate());
-               }
-               Thread.sleep(feedDefinition.getUpdateRate());
-            } catch (InterruptedException ie){
-            }
-         }
-      }
+        }
 
-      private boolean isStarted(){
-         // Refresh index before querying it.
-         client.admin().indices().prepareRefresh("_river").execute().actionGet();
-         GetResponse isStartedGetResponse = client.prepareGet("_river", riverName().name(), "_drivestatus").execute().actionGet();
-         try{
-            if (!isStartedGetResponse.isExists()){
-               XContentBuilder xb = jsonBuilder().startObject()
-                     .startObject("google-drive")
-                        .field("feedname", feedDefinition.getFeedname())
-                        .field("status", "STARTED").endObject()
-                     .endObject();
-               client.prepareIndex("_river", riverName.name(), "_drivestatus").setSource(xb).execute();
-               return true;
+        try {
+            // If needed, we create the new mapping for files
+            pushMapping(indexName, typeName, DriveRiverUtil.buildDriveFileMapping(typeName));
+        } catch (Exception e) {
+            logger.warn("Failed to create mapping for [{}/{}], disabling river...",
+                    e, indexName, typeName);
+            return;
+        }
+
+        //create indices
+        try {
+            drive.createIndices();
+        } catch (IOException e) {
+            logger.warn("Failed to create new indices from subfolders for [{}/{}], disabling river...",
+                    e, indexName, typeName);
+            return;
+        }
+        // We create as many Threads as there are feeds.
+        feedThread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "fs_slurper")
+                .newThread(new DriveScanner(feedDefinition));
+        feedThread.start();
+    }
+
+
+    @Override
+    public void close() {
+        if (logger.isInfoEnabled()) {
+            logger.info("Closing google drive river");
+        }
+        closed = true;
+
+        // We have to close the Thread.
+        if (feedThread != null) {
+            feedThread.interrupt();
+        }
+    }
+
+    /**
+     * Check if a mapping already exists in an index
+     *
+     * @param index Index name
+     * @param type  Mapping name
+     * @return true if mapping exists
+     */
+    private boolean isMappingExist(String index, String type) {
+        ClusterState cs = client.admin().cluster().prepareState()
+                .setFilterIndices(index).execute().actionGet()
+                .getState();
+        // Check index metadata existence.
+        IndexMetaData imd = cs.getMetaData().index(index);
+        if (imd == null) {
+            return false;
+        }
+        // Check mapping metadata existence.
+        MappingMetaData mdd = imd.mapping(type);
+        if (mdd != null) {
+            return true;
+        }
+        return false;
+    }
+
+    private void pushMapping(String index, String type, XContentBuilder xcontent) throws Exception {
+        if (logger.isTraceEnabled()) {
+            logger.trace("pushMapping(" + index + ", " + type + ")");
+        }
+
+        // If type does not exist, we create it
+        boolean mappingExist = isMappingExist(index, type);
+        if (!mappingExist) {
+            logger.info("Mapping [" + index + "]/[" + type + "] doesn't exist. Creating it.");
+
+            // Read the mapping json file if exists and use it.
+            if (xcontent != null) {
+                if (logger.isTraceEnabled()) {
+                    logger.trace("Mapping for [" + index + "]/[" + type + "]=" + xcontent.string());
+                }
+                // Create type and mapping
+                PutMappingResponse response = client.admin().indices()
+                        .preparePutMapping(index)
+                        .setType(type)
+                        .setSource(xcontent)
+                        .execute().actionGet();
+                if (!response.isAcknowledged()) {
+                    throw new Exception("Could not define mapping for type [" + index + "]/[" + type + "].");
+                } else {
+                    if (logger.isInfoEnabled()) {
+                        if (mappingExist) {
+                            logger.info("Mapping definition for [" + index + "]/[" + type + "] succesfully merged.");
+                        } else {
+                            logger.info("Mapping definition for [" + index + "]/[" + type + "] succesfully created.");
+                        }
+                    }
+                }
             } else {
-               String status = (String)XContentMapValues.extractValue("google-drive.status", isStartedGetResponse.getSourceAsMap());
-               if ("STOPPED".equals(status)){
-                  return false;
-               }
+                if (logger.isInfoEnabled()) {
+                    logger.info("No mapping definition for [" + index + "]/[" + type + "]. Ignoring.");
+                }
             }
-         } catch (Exception e){
-            logger.warn("failed to get status for " + riverName().name() + ", throttling....", e);
-         }
-         return true;
-      }
-      
-      @SuppressWarnings("unchecked")
-      private Long getLastChangesIdFromRiver(String lastChangesField){
-         Long result = null;
-         try {
-            // Do something.
+        } else {
+            if (logger.isInfoEnabled()) {
+                logger.info("Mapping [" + index + "]/[" + type + "] already exists and mergeMapping is not set.");
+            }
+        }
+        if (logger.isTraceEnabled()) {
+            logger.trace("/pushMapping(" + index + ", " + type + ")");
+        }
+    }
+
+    /** */
+    private class DriveScanner implements Runnable {
+
+        private BulkRequestBuilder bulk;
+        private DriveRiverFeedDefinition feedDefinition;
+
+        public DriveScanner(DriveRiverFeedDefinition feedDefinition) {
+            this.feedDefinition = feedDefinition;
+        }
+
+        @Override
+        public void run() {
+            while (true) {
+                if (closed) {
+                    return;
+                }
+
+                try {
+                    if (isStarted()) {
+                        bulk = client.prepareBulk();
+                        // Scan folder starting from last changes id, then record the new one.
+                        Long lastChangesId = getLastChangesIdFromRiver("_lastChangesId");
+                        lastChangesId = scan(feedDefinition.getFolder(), lastChangesId);
+                        updateRiver("_lastChangesId", lastChangesId);
+
+                        // If some bulkActions remains, we should commit them
+                        commitBulk();
+                    } else {
+                        logger.info("Google Drive River is disabled for {}", riverName().name());
+                    }
+                } catch (Exception e) {
+                    logger.warn("Error while indexing content from {}", feedDefinition.getFolder());
+                    if (logger.isInfoEnabled()) {
+                        logger.info("Exception for folder {} is {}", feedDefinition.getFolder(), e);
+                        e.printStackTrace();
+                    }
+                }
+
+                try {
+                    if (logger.isInfoEnabled()) {
+                        logger.info("Google drive river is going to sleep for {} ms", feedDefinition.getUpdateRate());
+                    }
+                    Thread.sleep(feedDefinition.getUpdateRate());
+                } catch (InterruptedException ie) {
+                }
+            }
+        }
+
+        private boolean isStarted() {
+            // Refresh index before querying it.
             client.admin().indices().prepareRefresh("_river").execute().actionGet();
-            GetResponse lastSeqGetResponse = client.prepareGet("_river", riverName().name(),
-                  lastChangesField).execute().actionGet();
-            if (lastSeqGetResponse.isExists()) {
-               Map<String, Object> fsState = (Map<String, Object>) lastSeqGetResponse.getSourceAsMap().get("google-drive");
+            GetResponse isStartedGetResponse = client.prepareGet("_river", riverName().name(), "_drivestatus").execute().actionGet();
+            try {
+                if (!isStartedGetResponse.isExists()) {
+                    XContentBuilder xb = jsonBuilder().startObject()
+                            .startObject("google-drive")
+                            .field("feedname", feedDefinition.getFeedname())
+                            .field("status", "STARTED").endObject()
+                            .endObject();
+                    client.prepareIndex("_river", riverName.name(), "_drivestatus").setSource(xb).execute();
+                    return true;
+                } else {
+                    String status = (String) XContentMapValues.extractValue("google-drive.status", isStartedGetResponse.getSourceAsMap());
+                    if ("STOPPED".equals(status)) {
+                        return false;
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("failed to get status for " + riverName().name() + ", throttling....", e);
+            }
+            return true;
+        }
 
-               if (fsState != null){
-                  Object lastChanges = fsState.get(lastChangesField);
-                  if (lastChanges != null){
-                     try{
-                        result = Long.parseLong(lastChanges.toString());
-                     } catch (NumberFormatException nfe){
-                        logger.warn("Last recorded lastChangesId is not a Long {}", lastChanges.toString());
-                     }
-                  }
-               }
-            } else {
-               // This is first call, just log in debug mode.
-               if (logger.isDebugEnabled()){
-                  logger.debug("{} doesn't exist", lastChangesField);
-               }
-            }
-         } catch (Exception e) {
-            logger.warn("failed to get _lastChangesId, throttling....", e);
-         }
+        @SuppressWarnings("unchecked")
+        private Long getLastChangesIdFromRiver(String lastChangesField) {
+            Long result = null;
+            try {
+                // Do something.
+                client.admin().indices().prepareRefresh("_river").execute().actionGet();
+                GetResponse lastSeqGetResponse = client.prepareGet("_river", riverName().name(),
+                        lastChangesField).execute().actionGet();
+                if (lastSeqGetResponse.isExists()) {
+                    Map<String, Object> fsState = (Map<String, Object>) lastSeqGetResponse.getSourceAsMap().get("google-drive");
 
-         if (logger.isDebugEnabled()){
-            logger.debug("lastChangesId: {}", result);
-         }
-         return result;
-      }
-      
-      /** Scan the Google Drive folder for last changes. */
-      private Long scan(String folder, Long lastChangesId) throws Exception{
-         if (logger.isDebugEnabled()){
-            logger.debug("Starting scanning of folder {} since {}", folder, lastChangesId);
-         }
-         DriveChanges changes = drive.getChanges(lastChangesId);
-         
-         // Browse change and checks if its indexable before starting.
-         for (Change change : changes.getChanges()){
-            if (change.getFile() != null && DriveRiverUtil.isIndexable(change.getFile().getTitle(), 
-                  feedDefinition.getIncludes(), feedDefinition.getExcludes())){
-               if (change.getDeleted()){
-                  esDelete(indexName, typeName, change.getFileId());
-               } else {
-                  indexFile(change.getFile());
-               }
+                    if (fsState != null) {
+                        Object lastChanges = fsState.get(lastChangesField);
+                        if (lastChanges != null) {
+                            try {
+                                result = Long.parseLong(lastChanges.toString());
+                            } catch (NumberFormatException nfe) {
+                                logger.warn("Last recorded lastChangesId is not a Long {}", lastChanges.toString());
+                            }
+                        }
+                    }
+                } else {
+                    // This is first call, just log in info mode.
+                    if (logger.isInfoEnabled()) {
+                        logger.info("{} doesn't exist", lastChangesField);
+                    }
+                }
+            } catch (Exception e) {
+                logger.warn("failed to get _lastChangesId, throttling....", e);
             }
-         }
-         return changes.getLastChangeId();
-      }
-      
-      /** Index a Google Drive file by retrieving its content and building the suitable Json content. */
-      private void indexFile(File driveFile){
-         if (logger.isDebugEnabled()){
-            logger.debug("Trying to index '{}'", driveFile.getTitle());
-         }
-         
-         try{
-            byte[] fileContent = drive.getContent(driveFile);
-            if (fileContent != null){
-               // Parse content using Tika directly.
-               String parsedContent = TikaHolder.tika().parseToString(
-                     new BytesStreamInput(fileContent, false), new Metadata());
-               
-               esIndex(indexName, typeName, driveFile.getId(),
-                     jsonBuilder()
-                        .startObject()
-                           .field(DriveRiverUtil.DOC_FIELD_TITLE, driveFile.getTitle())
-                           .field(DriveRiverUtil.DOC_FIELD_CREATED_DATE, driveFile.getCreatedDate().getValue())
-                           .field(DriveRiverUtil.DOC_FIELD_MODIFIED_DATE, driveFile.getModifiedDate().getValue())
-                           .field(DriveRiverUtil.DOC_FIELD_SOURCE_URL, driveFile.getAlternateLink())
-                           .startObject("file")
-                              .field("_content_type", drive.getMimeType(driveFile))
-                              .field("_name", driveFile.getTitle())
-                              .field("title", driveFile.getTitle())
-                              .field("file", parsedContent)
-                           .endObject()
-                        .endObject());
-               
-               if (logger.isDebugEnabled()){
-                  logger.debug("Index " + driveFile.getTitle() + " : success");
-               }
-            } else {
-               logger.debug("File content was returned as null");
-            }
-         } catch (Exception e) {
-            logger.warn("Can not index " + driveFile.getTitle() + " : " + e.getMessage());
-         }
-      }
-      
-      /** Update river last changes id value.*/
-      private void updateRiver(String lastChangesField, Long lastChangesId) throws Exception{
-         if (logger.isDebugEnabled()){
-            logger.debug("Updating lastChangesField: {}", lastChangesId);
-         }
 
-         // We store the lastupdate date and some stats
-         XContentBuilder xb = jsonBuilder()
-            .startObject()
-               .startObject("google-drive")
-                  .field("feedname", feedDefinition.getFeedname())
-                  .field(lastChangesField, lastChangesId)
-               .endObject()
-            .endObject();
-         esIndex("_river", riverName.name(), lastChangesField, xb);
-      }
-      
-      /**
-       * Commit to ES if something is in queue
-       * @throws Exception
-       */
-      private void commitBulk() throws Exception{
-         if (bulk != null && bulk.numberOfActions() > 0){
-            if (logger.isDebugEnabled()){
-               logger.debug("ES Bulk Commit is needed");
+            if (logger.isInfoEnabled()) {
+                logger.info("lastChangesId: {}", result);
             }
-            BulkResponse response = bulk.execute().actionGet();
-            if (response.hasFailures()){
-               logger.warn("Failed to execute " + response.buildFailureMessage());
-            }
-         }
-      }
-      
-      /**
-       * Commit to ES if we have too much in bulk 
-       * @throws Exception
-       */
-      private void commitBulkIfNeeded() throws Exception {
-         if (bulk != null && bulk.numberOfActions() > 0 && bulk.numberOfActions() >= bulkSize){
-            if (logger.isDebugEnabled()){
-               logger.debug("ES Bulk Commit is needed");
-            }
-            
-            BulkResponse response = bulk.execute().actionGet();
-            if (response.hasFailures()){
-               logger.warn("Failed to execute " + response.buildFailureMessage());
-            }
-            
-            // Reinit a new bulk.
-            bulk = client.prepareBulk();
-         }
-      }
-      
-      /** Add to bulk an IndexRequest. */
-      private void esIndex(String index, String type, String id, XContentBuilder xb) throws Exception{
-         if (logger.isDebugEnabled()){
-            logger.debug("Indexing in ES " + index + ", " + type + ", " + id);
-         }
-         if (logger.isTraceEnabled()){
-            logger.trace("Json indexed : {}", xb.string());
-         }
-         
-         bulk.add(client.prepareIndex(index, type, id).setSource(xb));
-         commitBulkIfNeeded();
-      }
+            return result;
+        }
 
-      /** Add to bulk a DeleteRequest. */
-      private void esDelete(String index, String type, String id) throws Exception{
-         if (logger.isDebugEnabled()){
-            logger.debug("Deleting from ES " + index + ", " + type + ", " + id);
-         }
-         bulk.add(client.prepareDelete(index, type, id));
-         commitBulkIfNeeded();
-      }
-   }
+        /**
+         * Scan the Google Drive folder for last changes.
+         */
+        private Long scan(String folder, Long lastChangesId) throws Exception {
+            if (logger.isInfoEnabled()) {
+                logger.info("Starting scanning of folder {} since {}", folder, lastChangesId);
+            }
+            DriveChanges changes = drive.getChanges(lastChangesId);
+
+            // Browse change and checks if its indexable before starting.
+            for (Change change : changes.getChanges()) {
+                if (change.getFile() != null && DriveRiverUtil.isIndexable(change.getFile().getTitle(),
+                        feedDefinition.getIncludes(), feedDefinition.getExcludes())) {
+                    if (change.getDeleted()) {
+                        esDelete(indexName, typeName, change.getFileId());
+                    } else {
+                        indexFile(change.getFile());
+                    }
+                }
+            }
+            return changes.getLastChangeId();
+        }
+
+        /**
+         * Index a Google Drive file by retrieving its content and building the suitable Json content.
+         */
+        private void indexFile(File driveFile) {
+            if (logger.isInfoEnabled()) {
+                logger.info("Trying to index '{}'", driveFile.getTitle());
+            }
+
+            try {
+                byte[] fileContent = drive.getContent(driveFile);
+                if (fileContent != null) {
+                    // Parse content using Tika directly.
+                    String parsedContent = TikaHolder.tika().parseToString(
+                            new BytesStreamInput(fileContent, false), new Metadata());
+
+                    esIndex(indexName, typeName, driveFile.getId(),
+                            jsonBuilder()
+                                    .startObject()
+                                    .field(DriveRiverUtil.DOC_FIELD_TITLE, driveFile.getTitle())
+                                    .field(DriveRiverUtil.DOC_FIELD_CREATED_DATE, driveFile.getCreatedDate().getValue())
+                                    .field(DriveRiverUtil.DOC_FIELD_MODIFIED_DATE, driveFile.getModifiedDate().getValue())
+                                    .field(DriveRiverUtil.DOC_FIELD_SOURCE_URL, driveFile.getAlternateLink())
+                                    .startObject("file")
+                                    .field("_content_type", drive.getMimeType(driveFile))
+                                    .field("_name", driveFile.getTitle())
+                                    .field("title", driveFile.getTitle())
+                                    .field("file", parsedContent)
+                                    .endObject()
+                                    .endObject()
+                    );
+
+                    if (logger.isInfoEnabled()) {
+                        logger.info("Index " + driveFile.getTitle() + " : success");
+                    }
+                } else {
+                    logger.info("File content was returned as null");
+                }
+            } catch (Exception e) {
+                logger.warn("Can not index " + driveFile.getTitle() + " : " + e.getMessage());
+            }
+        }
+
+        /**
+         * Update river last changes id value.
+         */
+        private void updateRiver(String lastChangesField, Long lastChangesId) throws Exception {
+            if (logger.isInfoEnabled()) {
+                logger.info("Updating lastChangesField: {}", lastChangesId);
+            }
+
+            // We store the lastupdate date and some stats
+            XContentBuilder xb = jsonBuilder()
+                    .startObject()
+                    .startObject("google-drive")
+                    .field("feedname", feedDefinition.getFeedname())
+                    .field(lastChangesField, lastChangesId)
+                    .endObject()
+                    .endObject();
+            esIndex("_river", riverName.name(), lastChangesField, xb);
+        }
+
+        /**
+         * Commit to ES if something is in queue
+         *
+         * @throws Exception
+         */
+        private void commitBulk() throws Exception {
+            if (bulk != null && bulk.numberOfActions() > 0) {
+                if (logger.isInfoEnabled()) {
+                    logger.info("ES Bulk Commit is needed");
+                }
+                BulkResponse response = bulk.execute().actionGet();
+                if (response.hasFailures()) {
+                    logger.warn("Failed to execute " + response.buildFailureMessage());
+                }
+            }
+        }
+
+        /**
+         * Commit to ES if we have too much in bulk
+         *
+         * @throws Exception
+         */
+        private void commitBulkIfNeeded() throws Exception {
+            if (bulk != null && bulk.numberOfActions() > 0 && bulk.numberOfActions() >= bulkSize) {
+                if (logger.isInfoEnabled()) {
+                    logger.info("ES Bulk Commit is needed");
+                }
+
+                BulkResponse response = bulk.execute().actionGet();
+                if (response.hasFailures()) {
+                    logger.warn("Failed to execute " + response.buildFailureMessage());
+                }
+
+                // Reinit a new bulk.
+                bulk = client.prepareBulk();
+            }
+        }
+
+        /**
+         * Add to bulk an IndexRequest.
+         */
+        private void esIndex(String index, String type, String id, XContentBuilder xb) throws Exception {
+            if (logger.isInfoEnabled()) {
+                logger.info("Indexing in ES " + index + ", " + type + ", " + id);
+            }
+            if (logger.isTraceEnabled()) {
+                logger.trace("Json indexed : {}", xb.string());
+            }
+
+            bulk.add(client.prepareIndex(index, type, id).setSource(xb));
+            commitBulkIfNeeded();
+        }
+
+        /**
+         * Add to bulk a DeleteRequest.
+         */
+        private void esDelete(String index, String type, String id) throws Exception {
+            if (logger.isInfoEnabled()) {
+                logger.info("Deleting from ES " + index + ", " + type + ", " + id);
+            }
+            bulk.add(client.prepareDelete(index, type, id));
+            commitBulkIfNeeded();
+        }
+    }
 }
