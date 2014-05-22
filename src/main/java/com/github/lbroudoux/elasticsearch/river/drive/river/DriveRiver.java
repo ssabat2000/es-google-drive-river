@@ -22,6 +22,9 @@ import com.github.lbroudoux.elasticsearch.river.drive.connector.DriveChanges;
 import com.github.lbroudoux.elasticsearch.river.drive.connector.DriveConnector;
 import com.google.api.services.drive.model.Change;
 import com.google.api.services.drive.model.File;
+import com.google.api.services.drive.model.ParentReference;
+import com.mediaray.elasticsearch.api.IndexSettings;
+import com.mediaray.elasticsearch.api.QueryManager;
 import org.apache.tika.metadata.Metadata;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.admin.indices.mapping.put.PutMappingResponse;
@@ -39,6 +42,7 @@ import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.indices.IndexAlreadyExistsException;
+import org.elasticsearch.indices.InvalidIndexNameException;
 import org.elasticsearch.river.AbstractRiverComponent;
 import org.elasticsearch.river.River;
 import org.elasticsearch.river.RiverName;
@@ -46,7 +50,9 @@ import org.elasticsearch.river.RiverSettings;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 
@@ -73,12 +79,14 @@ public class DriveRiver extends AbstractRiverComponent implements River {
 
     private final DriveConnector drive;
 
+    private QueryManager queryManager;
+
     @Inject
     @SuppressWarnings({"unchecked"})
     protected DriveRiver(RiverName riverName, RiverSettings settings, Client client) throws Exception {
         super(riverName, settings);
         this.client = client;
-
+        queryManager = new QueryManager(client);
         // Deal with connector settings.
         if (settings.settings().containsKey("google-drive")) {
             Map<String, Object> feed = (Map<String, Object>) settings.settings().get("google-drive");
@@ -157,14 +165,6 @@ public class DriveRiver extends AbstractRiverComponent implements River {
             return;
         }
 
-        //create indices
-        try {
-            drive.createIndices();
-        } catch (IOException e) {
-            logger.warn("Failed to create new indices from subfolders for [{}/{}], disabling river...",
-                    e, indexName, typeName);
-            return;
-        }
         // We create as many Threads as there are feeds.
         feedThread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "fs_slurper")
                 .newThread(new DriveScanner(feedDefinition));
@@ -268,6 +268,14 @@ public class DriveRiver extends AbstractRiverComponent implements River {
 
         @Override
         public void run() {
+            //create indices
+            try {
+                createIndices();
+            } catch (IOException e) {
+                logger.warn("Failed to create new indices from subfolders for [{}/{}], trying next loop...",
+                        e, indexName, typeName);
+            }
+
             while (true) {
                 if (closed) {
                     return;
@@ -302,6 +310,63 @@ public class DriveRiver extends AbstractRiverComponent implements River {
                 } catch (InterruptedException ie) {
                 }
             }
+        }
+
+        //create indices related to the various subfolders
+        private void createIndices() throws IOException {
+            drive.buildSubfoldersId();
+            Set<DriveConnector.FolderInfo> subfoldersId = drive.getSubfoldersId();
+            String rootFolderId = drive.getRootFolderId();
+
+            XContentBuilder mapping = null;
+            try {
+                mapping = IndexSettings.mapping();
+            } catch (Exception e1) {
+                // TODO Auto-generated catch block
+                logger.warn("failed to create mapping for [{}], disabling river...",
+                        "google-drive-river", e1);
+                throw new IOException("google drive indices mapping failed");
+            }
+
+            XContentBuilder indexSettings = null;
+            try {
+                indexSettings = IndexSettings.rssSettings("french", "5");
+            } catch (Exception e1) {
+                // TODO Auto-generated catch block
+                logger.warn("failed to create settings for [{}], disabling river...",
+                        "google-drive-river", e1);
+                throw new IOException("google drive indices settings failed");
+            }
+
+            //create indices
+            for (DriveConnector.FolderInfo folderInfo : subfoldersId) {
+                List<String> parents = drive.collectParents(folderInfo.getId());
+                String parent = parents.get(0);
+                if (!folderInfo.getId().equals(rootFolderId) && parent.equals(rootFolderId)) {
+                    try {
+                        logger.info("creating index for " + folderInfo.getName().toLowerCase());
+                        client.admin().indices().prepareCreate(folderInfo.getName().toLowerCase()).setSettings(indexSettings).execute().actionGet();
+                        client.admin().indices().preparePutMapping(folderInfo.getName().toLowerCase()).setType("_default_").setSource(mapping).execute().actionGet();
+                    } catch (Throwable e) {
+                        if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
+                            // that's fine
+                        } else if (e instanceof InvalidIndexNameException) {
+                            // that's fine too; this means an alias with the same name already exists
+                        } else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
+                            // ok, not recovered yet..., lets start indexing and hope we
+                            // recover by the first bulk
+                            // TODO: a smarter logic can be to register for cluster event
+                            // listener here, and only start sampling when the block is
+                            // removed...
+                        } else {
+                            logger.warn("failed to create index [{}], {}",
+                                    folderInfo.getName(), e);
+                        }
+                    }
+
+                }
+            }
+
         }
 
         private boolean isStarted() {
@@ -375,17 +440,33 @@ public class DriveRiver extends AbstractRiverComponent implements River {
             }
             DriveChanges changes = drive.getChanges(lastChangesId);
 
+            boolean bNewSubFolder = false;
             // Browse change and checks if its indexable before starting.
+            //two passes; check for new subfolder and create new indices
+            //then index files
+            for (Change change : changes.getChanges()) {
+                if (change.getFile() != null && change.getFile().getFileExtension() == null) { //subfolders
+                    logger.info("change : " + change.getFile().getTitle() + "...subfolder");
+                    bNewSubFolder = true;
+                    break;
+                }
+            }
+            if (bNewSubFolder) {
+                createIndices();
+            }
+
             for (Change change : changes.getChanges()) {
                 if (change.getFile() != null && DriveRiverUtil.isIndexable(change.getFile().getTitle(),
                         feedDefinition.getIncludes(), feedDefinition.getExcludes())) {
+                    logger.info("change : " + change.getFile().getTitle());
                     if (change.getDeleted()) {
-                        esDelete(indexName, typeName, change.getFileId());
+                        deleteFile(change.getFile());
                     } else {
                         indexFile(change.getFile());
                     }
                 }
             }
+
             return changes.getLastChangeId();
         }
 
@@ -398,36 +479,61 @@ public class DriveRiver extends AbstractRiverComponent implements River {
             }
 
             try {
-                byte[] fileContent = drive.getContent(driveFile);
-                if (fileContent != null) {
-                    // Parse content using Tika directly.
-                    String parsedContent = TikaHolder.tika().parseToString(
-                            new BytesStreamInput(fileContent, false), new Metadata());
+                //retrieve parents; specially first parent
+                List<ParentReference> parents = driveFile.getParents();
+                ParentReference parent = parents.get(0);
+                logger.info("indexFile. Retrieving parent info, id = " + parent.getId());
+                List<String> listParents = drive.collectParents(parent.getId());
+                String folderIndexId = "";
+                logger.info("sub folders list : " + listParents);
+                for(String name : listParents){
+                    logger.info(" name : " + name + " --> "+ drive.getFolderName(name));
+                }
+                if(listParents.size()>2 ){
+                    folderIndexId = listParents.get(listParents.size()-3);
+                    logger.info("Found folder to index to : " + drive.getFolderName(folderIndexId).toLowerCase());
+                } else {
+                    //logger.warn("Could not find a proper index for " + driveFile.getTitle() + ". Exiting indexation.");
+                    folderIndexId = parent.getId();
+                    logger.info("Found folder to index to : " + drive.getFolderName(folderIndexId).toLowerCase());
+                }
+                String indexName = drive.getFolderName(folderIndexId).toLowerCase();
+                String typeName = driveFile.getFileExtension().toLowerCase();
 
-                    esIndex(indexName, typeName, driveFile.getId(),
-                            jsonBuilder()
-                                    .startObject()
-                                    .field(DriveRiverUtil.DOC_FIELD_TITLE, driveFile.getTitle())
-                                    .field(DriveRiverUtil.DOC_FIELD_CREATED_DATE, driveFile.getCreatedDate().getValue())
-                                    .field(DriveRiverUtil.DOC_FIELD_MODIFIED_DATE, driveFile.getModifiedDate().getValue())
-                                    .field(DriveRiverUtil.DOC_FIELD_SOURCE_URL, driveFile.getAlternateLink())
-                                    .startObject("file")
-                                    .field("_content_type", drive.getMimeType(driveFile))
-                                    .field("_name", driveFile.getTitle())
-                                    .field("title", driveFile.getTitle())
-                                    .field("file", parsedContent)
-                                    .endObject()
-                                    .endObject()
-                    );
+                GetResponse response = queryManager.getDescription(indexName,typeName,driveFile.getId(),null);
+                if(!response.isExists()) {
+                    byte[] fileContent = drive.getContent(driveFile);
+                    if (fileContent != null) {
+                        // Parse content using Tika directly.
+                        String parsedContent = TikaHolder.tika().parseToString(
+                                new BytesStreamInput(fileContent, false), new Metadata());
+                        esIndex(indexName, typeName, driveFile.getId(),
+                                jsonBuilder()
+                                        .startObject()
+                                        .field(DriveRiverUtil.DOC_FIELD_TITLE, driveFile.getTitle())
+                                        .field(DriveRiverUtil.DOC_FIELD_CREATED_DATE, driveFile.getCreatedDate().getValue())
+                                        .field(DriveRiverUtil.DOC_FIELD_MODIFIED_DATE, driveFile.getModifiedDate().getValue())
+                                        .field(DriveRiverUtil.DOC_FIELD_SOURCE_URL, driveFile.getAlternateLink())
+                                        .startObject("file")
+                                        .field("_content_type", drive.getMimeType(driveFile))
+                                        .field("_name", driveFile.getTitle())
+                                        .field("title", driveFile.getTitle())
+                                        .field("file", parsedContent)
+                                        .endObject()
+                                        .endObject()
+                        );
 
-                    if (logger.isInfoEnabled()) {
-                        logger.info("Index " + driveFile.getTitle() + " : success");
+                        if (logger.isInfoEnabled()) {
+                            logger.info("Index " + driveFile.getTitle() + " : success.");
+                        }
+                    } else {
+                        logger.info("File content was returned as null.");
                     }
                 } else {
-                    logger.info("File content was returned as null");
+                    logger.info("File " + driveFile.getTitle() + " already indexed in " + indexName + ".");
                 }
-            } catch (Exception e) {
-                logger.warn("Can not index " + driveFile.getTitle() + " : " + e.getMessage());
+            } catch (Throwable t) {
+                logger.warn("Can not index " + driveFile.getTitle() + " : " + t.getMessage());
             }
         }
 
@@ -503,15 +609,26 @@ public class DriveRiver extends AbstractRiverComponent implements River {
             commitBulkIfNeeded();
         }
 
-        /**
-         * Add to bulk a DeleteRequest.
-         */
-        private void esDelete(String index, String type, String id) throws Exception {
+        private void esDelete(String index, String type, String id) throws Exception{
             if (logger.isInfoEnabled()) {
                 logger.info("Deleting from ES " + index + ", " + type + ", " + id);
             }
+
             bulk.add(client.prepareDelete(index, type, id));
             commitBulkIfNeeded();
+        }
+
+        /**
+         * Add to bulk a DeleteRequest.
+         */
+        private void deleteFile(File driveFile) throws Exception {
+            List<ParentReference> parents = driveFile.getParents();
+            ParentReference parent =  parents.get(0);
+            String parentFolderName = drive.getFolderName(parent.getId());
+            logger.info("deleteFile. Retrieving parent info, id = " + parent.getId() + ", name = " + parentFolderName);
+            String indexName = parentFolderName.toLowerCase();
+            String typeName = driveFile.getFileExtension().toLowerCase();
+            esDelete(indexName,typeName,driveFile.getId());
         }
     }
 }

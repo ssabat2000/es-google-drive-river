@@ -32,15 +32,9 @@ import com.google.api.services.drive.Drive;
 import com.google.api.services.drive.Drive.Changes;
 import com.google.api.services.drive.Drive.Files;
 import com.google.api.services.drive.model.*;
-import com.mediaray.elasticsearch.api.IndexSettings;
-import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.client.Client;
-import org.elasticsearch.cluster.block.ClusterBlockException;
 import org.elasticsearch.common.logging.ESLogger;
 import org.elasticsearch.common.logging.Loggers;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.indices.IndexAlreadyExistsException;
-import org.elasticsearch.indices.InvalidIndexNameException;
 
 import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
@@ -65,21 +59,37 @@ public class DriveConnector {
     /** */
     public static final String APPLICATION_VND_GOOGLE_APPS_SPREADSHEET = "application/vnd.google-apps.spreadsheet";
 
-    private Client client;
     private final String clientId;
     private final String clientSecret;
     private final String refreshToken;
     private String folderName;
     private Drive service;
-    private Set<FolderInfo> subfoldersId;
+
+    private Set<FolderInfo> subfoldersId = new TreeSet<FolderInfo>();
+    private Map<String, String> folderIdToName = new HashMap<String, String>();
+
+    Map<String, String> folderIdToParentId = new HashMap<String, String>();
+
     private String rootFolderId;
 
     public DriveConnector(String clientId, String clientSecret, String refreshToken, Client client) {
         this.clientId = clientId;
         this.clientSecret = clientSecret;
         this.refreshToken = refreshToken;
-        this.client = client;
     }
+
+    public String getRootFolderId() {
+        return rootFolderId;
+    }
+
+    public Set<FolderInfo> getSubfoldersId() {
+        return subfoldersId;
+    }
+
+    public String getFolderName(String folderId) {
+        return folderIdToName.get(folderId);
+    }
+
 
     /**
      * Actually connect to specified drive, exchanging refresh token for an up-to-date
@@ -110,15 +120,6 @@ public class DriveConnector {
 
         service = new Drive.Builder(httpTransport, jsonFactory, credential).build();
         logger.info("Connection established.");
-
-        if (folderName != null) {
-            logger.info("Retrieving scanned subfolders under folder {}, this may take a while...", folderName);
-            subfoldersId = getSubfoldersId(folderName);
-            logger.info("Subfolders to scan found");
-            if (logger.isInfoEnabled()) {
-                logger.info("Found {} valid subfolders under folder {}", subfoldersId.size(), folderName);
-            }
-        }
     }
 
     /**
@@ -283,8 +284,8 @@ public class DriveConnector {
             List<ParentReference> references = change.getFile().getParents();
             if (references != null && !references.isEmpty()) {
                 for (ParentReference reference : references) {
-                    for(FolderInfo folderInfo : subfoldersId){
-                        if(folderInfo.getId().equals(reference.getId())){
+                    for (FolderInfo folderInfo : subfoldersId) {
+                        if (folderInfo.getId().equals(reference.getId())) {
                             return true;
                         }
                     }
@@ -301,35 +302,34 @@ public class DriveConnector {
     /**
      * Retrieve all the ids of subfolders under root folder name (recursively).
      */
-    private Set<FolderInfo> getSubfoldersId(String rootFolderName) throws IOException {
-        Set<FolderInfo> subfoldersId = new TreeSet<FolderInfo>();
-        Map<String, String> folderIdToName = new HashMap<String, String>();
+    public void buildSubfoldersId() throws IOException {
         Files.List request = null;
 
+        logger.info("Retrieving scanned subfolders under folder {}, this may take a while...", folderName);
+        if (folderName == null) {
+            logger.info("No root folder found. Exting buildSubfoldersId().");
+        }
         // 1st step: ensure folder is existing and retrieve its id.
         try {
             request = service.files().list()
                     .setMaxResults(100)
-                    .setQ("title='" + rootFolderName + "' and mimeType='" + APPLICATION_VND_GOOGLE_APPS_FOLDER
+                    .setQ("title='" + folderName + "' and mimeType='" + APPLICATION_VND_GOOGLE_APPS_FOLDER
                             + "' and 'root' in parents");
             FileList files = request.execute();
             logger.info("Found {} files corresponding to searched root folder", files.getItems().size());
             if (files != null && files.getItems().size() != 1) {
-                throw new FileNotFoundException(rootFolderName + " does not seem to be a valid folder into Google Drive root");
+                throw new FileNotFoundException(folderName + " does not seem to be a valid folder into Google Drive root");
             }
             rootFolderId = files.getItems().get(0).getId();
             folderIdToName.put(rootFolderId, files.getItems().get(0).getTitle());
             logger.info("Id of searched root folder is {}", rootFolderId);
         } catch (IOException ioe) {
-            logger.error("IOException while retrieving root folder {} on drive service", rootFolderName, ioe);
+            logger.error("IOException while retrieving root folder {} on drive service", folderName, ioe);
             throw ioe;
         }
 
         // 2nd step: retrieve all folders in drive ('cause we cannot get root folder children
         // recursively with a single query) and store them into a map for later filtering.
-        Map<String, String> folderIdToParentId = new HashMap<String, String>();
-
-
         try {
             request = service.files().list()
                     .setMaxResults(Integer.MAX_VALUE)
@@ -355,14 +355,14 @@ public class DriveConnector {
                 subfoldersId.add(new FolderInfo(folderId, folderIdToName.get(folderId)));
             } else {
                 // Else, check the parents.
-                List<String> parents = collectParents(folderId, folderIdToParentId);
+                List<String> parents = collectParents(folderId);
                 logger.info("Parents of {} are {}", folderId, parents);
                 // Last parent if the root of the drive, so searched root folder is the one before.
                 if (parents.size() > 1 && parents.get(parents.size() - 2).equals(rootFolderId)) {
                     // Found a valid path to root folder, add folder and its parents but remove root before.
                     subfoldersId.add(new FolderInfo(folderId, folderIdToName.get(folderId)));
                     parents.remove(parents.size() - 1);
-                    for(String parent : parents) {
+                    for (String parent : parents) {
                         subfoldersId.add(new FolderInfo(parent, folderIdToName.get(parent)));
                     }
                 }
@@ -372,13 +372,12 @@ public class DriveConnector {
             logger.info("Subfolders Id to scan are {}", subfoldersId);
 
         }
-        return subfoldersId;
     }
 
     /**
      * Get the list of parents Id in ascending order.
      */
-    private List<String> collectParents(String folderId, Map<String, String> folderIdToParentId) {
+    public List<String> collectParents(String folderId) {
         String parentId = folderIdToParentId.get(folderId);
         if (logger.isTraceEnabled()) {
             logger.trace("Direct parent of {} is {}", folderId, parentId);
@@ -387,65 +386,13 @@ public class DriveConnector {
         ancestors.add(parentId);
 
         if (folderIdToParentId.containsKey(parentId)) {
-            ancestors.addAll(collectParents(parentId, folderIdToParentId));
+            ancestors.addAll(collectParents(parentId));
             return ancestors;
         }
         return ancestors;
     }
 
-    //create indices related to the various subfolders
-    public void createIndices() throws IOException {
-
-        XContentBuilder mapping = null;
-        try {
-            mapping = IndexSettings.mapping();
-        } catch (Exception e1) {
-            // TODO Auto-generated catch block
-            logger.warn("failed to create mapping for [{}], disabling river...",
-                    "google-drive-river", e1);
-            throw new IOException("google drive indices mapping failed");
-        }
-
-        XContentBuilder indexSettings = null;
-        try {
-            indexSettings = IndexSettings.rssSettings("french", "5");
-        } catch (Exception e1) {
-            // TODO Auto-generated catch block
-            logger.warn("failed to create settings for [{}], disabling river...",
-                    "google-drive-river", e1);
-            throw new IOException("google drive indices settings failed");
-        }
-
-        //create indices
-        for (DriveConnector.FolderInfo folderInfo : subfoldersId) {
-            if (!folderInfo.getId().equals(rootFolderId)) {
-                try {
-                    logger.info("creating index for " + folderInfo.getName().toLowerCase());
-                    client.admin().indices().prepareCreate(folderInfo.getName().toLowerCase()).setSettings(indexSettings).execute().actionGet();
-                    client.admin().indices().preparePutMapping(folderInfo.getName().toLowerCase()).setType("_default_").setSource(mapping).execute().actionGet();
-                } catch (Throwable e) {
-                    if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
-                        // that's fine
-                    } else if (e instanceof InvalidIndexNameException) {
-                        // that's fine too; this means an alias with the same name already exists
-                    } else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
-                        // ok, not recovered yet..., lets start indexing and hope we
-                        // recover by the first bulk
-                        // TODO: a smarter logic can be to register for cluster event
-                        // listener here, and only start sampling when the block is
-                        // removed...
-                    } else {
-                        logger.warn("failed to create index [{}], {}",
-                                folderInfo.getName(), e);
-                    }
-                }
-
-            }
-        }
-
-    }
-
-    public class FolderInfo implements Comparable<FolderInfo>{
+    public class FolderInfo implements Comparable<FolderInfo> {
         private String Id;
         private String name;
 
@@ -470,7 +417,7 @@ public class DriveConnector {
             this.name = name;
         }
 
-        public String toString(){
+        public String toString() {
             return getName();
         }
 
